@@ -8,7 +8,14 @@ use layerfs_bridge::{
 use layerfs_sandbox::backend::docker::{
     Docker, ListenerFailure, Sandbox, SandboxCreateFailure, SandboxRequest, UploadFailure,
 };
-use std::{fmt, fs::File, io, net::TcpStream, path::PathBuf, time::Duration};
+use std::{
+    fmt,
+    fs::File,
+    io,
+    net::TcpStream,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 /// One actual stopped-container deployment, private archive and authenticated startup.
 #[derive(Clone)]
 pub struct SandboxCreate {
@@ -61,6 +68,29 @@ pub fn connect_address(
                 format!("daemon host {host} has no address"),
             )
         })
+}
+/// Dials a daemon's published port within `wait`. The port can refuse for a
+/// moment after the listener event: a Docker that forwards its loopback
+/// publish to another host (OrbStack on macOS) starts forwarding about 0.4s
+/// later. A refusal or reset is dialed again until `wait` has passed; any
+/// other error, or the last refusal, is the result.
+fn connect_published(address: &std::net::SocketAddr, wait: Duration) -> io::Result<TcpStream> {
+    let deadline = Instant::now() + wait;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match TcpStream::connect_timeout(address, left.max(Duration::from_millis(1))) {
+            Ok(stream) => return Ok(stream),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionRefused | io::ErrorKind::ConnectionReset
+                ) && left > Duration::from_millis(100) =>
+            {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 /// Concrete boundary reached by one original lifecycle operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -350,8 +380,7 @@ pub(crate) fn create(
         phase = SandboxPhase::Connect;
         let address =
             connect_address(endpoint, request.connect_host.as_deref()).map_err(SandboxCause::Io)?;
-        let stream =
-            TcpStream::connect_timeout(&address, request.startup_wait).map_err(SandboxCause::Io)?;
+        let stream = connect_published(&address, request.startup_wait).map_err(SandboxCause::Io)?;
         stream
             .set_read_timeout(Some(request.startup_wait))
             .map_err(SandboxCause::Io)?;
